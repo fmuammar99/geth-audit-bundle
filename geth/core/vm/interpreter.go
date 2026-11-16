@@ -1,0 +1,318 @@
+// Copyright 2014 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+package vm
+
+import (
+	"fmt"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/holiman/uint256"
+)
+
+// Config are the configuration options for the Interpreter
+type Config struct {
+	Tracer *tracing.Hooks
+
+	NoBaseFee                bool  // Forces the EIP-1559 baseFee to 0 (needed for 0 price calls)
+	EnablePreimageRecording  bool  // Enables recording of SHA3/keccak preimages
+	ExtraEips                []int // Additional EIPS that are to be enabled
+	DisableParallelExecution bool  // Disable parallel block processing
+}
+
+// ScopeContext contains the things that are per-call, such as stack and memory,
+// but not transients like pc and gas
+type ScopeContext struct {
+	Memory   *Memory
+	Stack    *Stack
+	Contract *Contract
+}
+
+// MemoryData returns the underlying memory slice. Callers must not modify the contents
+// of the returned data.
+func (ctx *ScopeContext) MemoryData() []byte {
+	if ctx.Memory == nil {
+		return nil
+	}
+	return ctx.Memory.Data()
+}
+
+// StackData returns the stack data. Callers must not modify the contents
+// of the returned data.
+func (ctx *ScopeContext) StackData() []uint256.Int {
+	if ctx.Stack == nil {
+		return nil
+	}
+	return ctx.Stack.Data()
+}
+
+// Caller returns the current caller.
+func (ctx *ScopeContext) Caller() common.Address {
+	return ctx.Contract.Caller()
+}
+
+// Address returns the address where this scope of execution is taking place.
+func (ctx *ScopeContext) Address() common.Address {
+	return ctx.Contract.Address()
+}
+
+// CallValue returns the value supplied with this call.
+func (ctx *ScopeContext) CallValue() *uint256.Int {
+	return ctx.Contract.Value()
+}
+
+// CallInput returns the input/calldata with this call. Callers must not modify
+// the contents of the returned data.
+func (ctx *ScopeContext) CallInput() []byte {
+	return ctx.Contract.Input
+}
+
+// ContractCode returns the code of the contract being executed.
+func (ctx *ScopeContext) ContractCode() []byte {
+	return ctx.Contract.Code
+}
+
+// Run loops and evaluates the contract's code with the given input data and returns
+// the return byte-slice and an error if one occurred.
+//
+// It's important to note that any errors returned by the interpreter should be
+// considered a revert-and-consume-all-gas operation except for
+// ErrExecutionReverted which means revert-and-keep-gas-left.
+func (evm *EVM) Run(contract *Contract, input []byte, readOnly bool) (ret []byte, err error) {
+	// Increment the call depth which is restricted to 1024
+	evm.depth++
+	defer func() { evm.depth-- }()
+
+	// Make sure the readOnly is only set if we aren't in readOnly yet.
+	// This also makes sure that the readOnly flag isn't removed for child calls.
+	if readOnly && !evm.readOnly {
+		evm.readOnly = true
+		defer func() { evm.readOnly = false }()
+	}
+
+	// Reset the previous call's return data. It's unimportant to preserve the old buffer
+	// as every returning call will return new data anyway.
+	evm.returnData = nil
+
+	// Don't bother with the execution if there's no code.
+	if len(contract.Code) == 0 {
+		return nil, nil
+	}
+	contract.Input = input
+
+	mem := NewMemory()         // bound memory
+	stack := evm.arena.stack() // local stack
+	scope := &ScopeContext{
+		Memory:   mem,
+		Stack:    stack,
+		Contract: contract,
+	}
+	defer func() {
+		stack.release()
+		mem.Free()
+	}()
+
+	// The generated fast path resolves its fork gates at generate time, so it
+	// cannot see table changes made by ExtraEips. Those configs run the table
+	// loop, as do tracing and the differential test via forceTableLoop.
+	if evm.forceTableLoop || len(evm.Config.ExtraEips) > 0 || evm.Config.Tracer != nil {
+		return evm.execTraced(scope)
+	}
+	return evm.execUntraced(scope)
+}
+
+// execTraced is the old table-walking interpreter loop. It dispatches every
+// opcode through the per-fork operation table and emits the tracing hooks.
+//
+// The differential test also runs this loop without a tracer and compares it
+// against the generated execUntraced, which keeps the two from drifting
+// apart.
+func (evm *EVM) execTraced(scope *ScopeContext) (ret []byte, err error) {
+	var (
+		op          OpCode     // current opcode
+		jumpTable   *JumpTable = evm.table
+		mem                    = scope.Memory
+		stack                  = scope.Stack
+		contract               = scope.Contract
+		callContext            = scope
+
+		// For optimisation reason we're using uint64 as the program counter.
+		// It's theoretically possible to go above 2^64. The YP defines the PC
+		// to be uint256. Practically much less so feasible.
+		pc = uint64(0) // program counter
+
+		// copies used by tracer
+		pcCopy  uint64    // needed for the deferred EVMLogger
+		gasCopy GasBudget // budget before the opcode, for the tracer hooks
+		logged  bool      // deferred EVMLogger should ignore already logged steps
+		res     []byte    // result of the opcode execution function
+		debug   = evm.Config.Tracer != nil
+	)
+	if debug {
+		defer func() { // this deferred method handles exit-with-error
+			if err == nil {
+				return
+			}
+			if !logged && evm.Config.Tracer.HasOpcodeHook() {
+				evm.Config.Tracer.EmitOpcode(pcCopy, byte(op), gasCopy.AsTracing(), tracing.OpCost{}, callContext, evm.returnData, evm.depth, VMErrorFromErr(err))
+			}
+			if logged && evm.Config.Tracer.HasFaultHook() {
+				evm.Config.Tracer.EmitFault(pcCopy, byte(op), gasCopy.AsTracing(), tracing.OpCost{}, callContext, evm.depth, VMErrorFromErr(err))
+			}
+		}()
+	}
+	// The Interpreter main run loop (contextual). This loop runs until either an
+	// explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during
+	// the execution of one of the operations or until the done flag is set by the
+	// parent context.
+	_ = jumpTable[0] // nil-check the jumpTable out of the loop
+	for {
+		if debug {
+			// Capture pre-execution values for tracing.
+			logged, pcCopy, gasCopy = false, pc, contract.Gas
+		}
+		// Get the operation from the jump table and validate the stack to ensure there are
+		// enough stack items available to perform the operation.
+		op = contract.GetOp(pc)
+		operation := jumpTable[op]
+		execCost := operation.constantGas
+
+		// Validate stack
+		if sLen := stack.len(); sLen < operation.minStack {
+			return nil, &ErrStackUnderflow{stackLen: sLen, required: operation.minStack}
+		} else if sLen > operation.maxStack {
+			return nil, &ErrStackOverflow{stackLen: sLen, limit: operation.maxStack}
+		}
+		// for tracing: this gas consumption event is emitted below in the debug section.
+		if !contract.Gas.ChargeExecutionOnly(execCost) {
+			return nil, ErrOutOfGas
+		}
+
+		// All ops with a dynamic memory usage also has a dynamic gas cost. Size the
+		// memory and charge dynamic gas here.
+		var (
+			memorySize  uint64
+			dynamicCost GasCosts
+		)
+		memorySize, dynamicCost, err = contract.meterDynamicGas(operation, evm, stack, mem)
+		if err != nil {
+			return nil, err
+		}
+
+		// Do tracing before potential memory expansion
+		if debug {
+			if evm.Config.Tracer.HasGasHook() {
+				evm.Config.Tracer.EmitGasChange(
+					gasCopy.AsTracing(),
+					contract.Gas.AsTracing(),
+					tracing.GasChangeCallOpCode,
+				)
+			}
+			if evm.Config.Tracer.HasOpcodeHook() {
+				// CREATE and CREATE2 charge account creation while executing,
+				// outside the dynamic gas cost, so it is looked ahead here.
+				cost := tracing.OpCost{
+					Execution: execCost + dynamicCost.ExecutionGas,
+					State:     int64(dynamicCost.StateGas) - int64(dynamicCost.StateGasRefill),
+				}
+				if op == CREATE || op == CREATE2 {
+					cost.State += int64(evm.pendingAccountCreation(op, callContext))
+				}
+				evm.Config.Tracer.EmitOpcode(pc, byte(op), gasCopy.AsTracing(), cost, callContext, evm.returnData, evm.depth, VMErrorFromErr(err))
+				logged = true
+			}
+		}
+		// Expand the memory if necessary
+		if memorySize > 0 {
+			mem.Resize(memorySize)
+		}
+
+		// Execute the operation
+		res, err = operation.execute(&pc, evm, callContext)
+		if err != nil {
+			break
+		}
+		pc++
+	}
+
+	if err == errStopToken {
+		err = nil // clear stop token error
+	}
+	return res, err
+}
+
+// computeMemorySize runs an operation's memorySize function and word-aligns the
+// result, guarding overflow.
+func computeMemorySize(memFn memorySizeFunc, stack *Stack) (uint64, error) {
+	memSize, overflow := memFn(stack)
+	if overflow {
+		return 0, ErrGasUintOverflow
+	}
+	// memory is expanded in words of 32 bytes. Gas is also calculated in words.
+	size, overflow := math.SafeMul(toWordSize(memSize), 32)
+	if overflow {
+		return 0, ErrGasUintOverflow
+	}
+	return size, nil
+}
+
+// chargeDynamicGas runs an operation's dynamicGas function, treats a computation
+// failure as out of gas, and charges the cost. It returns the cost so the traced
+// loop can report it.
+func (contract *Contract) chargeDynamicGas(dynFn gasFunc, evm *EVM, stack *Stack, mem *Memory, memorySize uint64) (GasCosts, error) {
+	dynamicCost, gerr := dynFn(evm, contract, stack, mem, memorySize)
+	if gerr != nil {
+		return dynamicCost, fmt.Errorf("%w: %v", ErrOutOfGas, gerr)
+	}
+	// A execution-only deduction when there is no state gas, otherwise the full
+	// multidimensional charge through the reservoir.
+	if dynamicCost.StateGas == 0 {
+		if !contract.Gas.ChargeExecutionOnly(dynamicCost.ExecutionGas) {
+			return dynamicCost, ErrOutOfGas
+		}
+	} else if !contract.Gas.charge(dynamicCost) {
+		return dynamicCost, ErrOutOfGas
+	}
+	// Apply refills only after the charge succeeds, so they cannot fund the
+	// opcode's execution-gas charge. Ordering does not matter for SSTORE:
+	// its pre-state checks ensure the access cost, its only execution-gas
+	// charge when refilling, is affordable. Future opcodes with inline state-gas
+	// refills may not provide this guarantee.
+	if dynamicCost.StateGasRefill != 0 {
+		contract.Gas.RefundState(dynamicCost.StateGasRefill)
+	}
+	return dynamicCost, nil
+}
+
+// meterDynamicGas sizes the memory an operation needs and charges its dynamic
+// gas, returning the size to expand to and the charged cost (which the traced
+// loop reports). The caller expands the memory afterward. computeMemorySize and
+// chargeDynamicGas do the work.
+func (contract *Contract) meterDynamicGas(operation *operation, evm *EVM, stack *Stack, mem *Memory) (memorySize uint64, dynamicCost GasCosts, err error) {
+	if operation.dynamicGas != nil {
+		if operation.memorySize != nil {
+			if memorySize, err = computeMemorySize(operation.memorySize, stack); err != nil {
+				return memorySize, dynamicCost, err
+			}
+		}
+		if dynamicCost, err = contract.chargeDynamicGas(operation.dynamicGas, evm, stack, mem, memorySize); err != nil {
+			return memorySize, dynamicCost, err
+		}
+	}
+	return memorySize, dynamicCost, nil
+}
